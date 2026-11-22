@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+name=inkling-dgx-spark
+label=io.inkling-dgx-spark.recipe
+recipe=sglang-gb10-v1
+image=lmsysorg/sglang@sha256:efac853b46811ccb760545b7b29e7119bdf907537ccf6e863fac3011fe8b98de
+model=thinkingmachines/Inkling-2-Mini
+revision=ed40e7da625f594fc9c4990f5f66be24873c22d7
+hub_cache=${HF_HUB_CACHE:-"$HOME/.cache/huggingface/hub"}
+lock_dir=${XDG_STATE_HOME:-"$HOME/.local/state"}/inkling-dgx-spark
+
+assert_owned() {
+    if [[ $(docker inspect --format "{{ index .Config.Labels \"$label\" }}" "$name") != "$recipe" ]]; then
+        printf 'Container %s has a different recipe. Inspect it before proceeding.\n' "$name" >&2
+        exit 1
+    fi
+}
+
+lock() {
+    mkdir -p "$lock_dir"
+    exec 9>"$lock_dir/server.lock"
+    flock -n 9 || { echo 'Another Inkling service change is running.' >&2; exit 75; }
+}
+
+case ${1:-start} in
+start)
+    lock
+    if docker container inspect "$name" >/dev/null 2>&1; then
+        assert_owned
+        if [[ $(docker inspect --format '{{.State.Running}}' "$name") != true ]]; then
+            docker start "$name"
+        fi
+        exit 0
+    fi
+    snapshot="$hub_cache/models--thinkingmachines--Inkling-2-Mini/snapshots/$revision"
+    if [[ ! -r "$snapshot/config.json" ]]; then
+        printf 'Pinned checkpoint not found at %s. Run the hf download command in the README.\n' "$snapshot" >&2
+        exit 1
+    fi
+    docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
+    docker run -d --name "$name" --label "$label=$recipe" --restart unless-stopped \
+        --runtime nvidia --gpus all --ipc=host \
+        -p 127.0.0.1:18121:8000 -v "$hub_cache:/root/.cache/huggingface/hub:ro" \
+        -e HF_HUB_OFFLINE=1 -e SGLANG_OPT_INKLING2_VERIFY_REL_BIAS_KERNEL=1 \
+        -e SGLANG_OPT_DSV41_DSPARK_MID_FOLD=1 -e SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE=1 \
+        -e SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS=1 -e SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=1 \
+        -e SGLANG_OPT_MOE_QUANT_ONCE=1 --entrypoint sglang "$image" serve \
+        --model-path "$model" --revision "$revision" --served-model-name "$model" \
+        --host 0.0.0.0 --port 8000 --tp 1 --ep 1 --attention-backend fa4 --dtype bfloat16 \
+        --context-length 524288 --page-size 16 --speculative-algorithm DSPARK --speculative-num-draft-tokens 8 \
+        --mem-fraction-static 0.60 --max-running-requests 1 --cuda-graph-max-bs-decode 1 \
+        --grammar-backend xgrammar --enable-multimodal --reasoning-parser inkling --tool-call-parser inkling2
+    ;;
+stop)
+    lock
+    assert_owned
+    docker stop -t 45 "$name"
+    ;;
+status) docker inspect --format '{{.State.Status}}' "$name" ;;
+logs) docker logs --tail 80 "$name" ;;
+*) echo 'Usage: serve [start|stop|status|logs]' >&2; exit 2 ;;
+esac

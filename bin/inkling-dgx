@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+host=${INKLING_SSH_HOST:-dgx}
+local_port=${INKLING_LOCAL_PORT:-18121}
+state=${XDG_STATE_HOME:-"$HOME/.local/state"}/inkling-dgx-spark
+model=thinkingmachines/Inkling-2-Mini
+remote_service='bash ~/.local/share/inkling-dgx-spark/serve'
+mode=${1:-help}
+if (( $# > 0 )); then shift; fi
+
+case $mode in
+    help|-h|--help)
+        echo 'Usage: inkling-dgx {start|stop|status|logs|disconnect|opencode|opencode-low|pi} [client arguments]'
+        exit 0 ;;
+    start|stop|status|logs|disconnect|opencode|opencode-low|pi) ;;
+    *) echo "Unknown command: $mode" >&2; exit 2 ;;
+esac
+
+if [[ ! $host =~ ^[[:alnum:]][[:alnum:]_.@-]*$ || ! $local_port =~ ^[1-9][0-9]{0,4}$ ]] || (( local_port > 65535 )); then
+    echo 'Use a valid INKLING_SSH_HOST and INKLING_LOCAL_PORT.' >&2
+    exit 2
+fi
+
+socket="$state/ssh-$host-$local_port.sock"
+api="http://127.0.0.1:$local_port/v1"
+
+remote() {
+    ssh "$host" "$remote_service $1"
+}
+
+tunnel() {
+    mkdir -p "$state"
+    if ! ssh -S "$socket" -O check "$host" >/dev/null 2>&1; then
+        ssh -fNT -M -S "$socket" -o ControlPersist=no -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            -L "127.0.0.1:$local_port:127.0.0.1:18121" "$host"
+    fi
+}
+
+ready() {
+    curl -fsS --max-time 3 "$api/models" 2>/dev/null |
+        python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(not any(x["id"]==sys.argv[1] and x.get("max_model_len")==524288 for x in d["data"]))' "$model" 2>/dev/null
+}
+
+case $mode in
+    logs|status) remote "$mode"; exit ;;
+    disconnect) ssh -S "$socket" -O exit "$host"; exit ;;
+    stop)
+        remote stop
+        ssh -S "$socket" -O exit "$host" >/dev/null 2>&1 || true
+        exit ;;
+esac
+
+remote start >/dev/null
+tunnel
+if ! ready; then
+    echo 'Waiting for the 524,288-token DGX endpoint…' >&2
+    deadline=$((SECONDS + 900))
+    until ready; do
+        if (( SECONDS >= deadline )); then
+            echo 'The endpoint is not ready. Inspect inkling-dgx logs.' >&2
+            exit 1
+        fi
+        sleep 4
+    done
+fi
+
+case $mode in
+    start) printf 'Ready at %s\n' "$api" ;;
+    opencode|opencode-low)
+        config=$(python3 "$root/bin/client-config.py" "$mode" "$root/config" "$api")
+        export OPENCODE_CONFIG_CONTENT="$config"
+        exec "${OPENCODE_BIN:-opencode}" --standalone "$@"
+        ;;
+    pi)
+        export PI_CODING_AGENT_DIR="$state/pi-$host-$local_port"
+        python3 "$root/bin/client-config.py" pi "$root/config" "$api"
+        exec "${PI_BIN:-pi}" --offline --provider inkling-dgx --model "$model" \
+            --models "inkling-dgx/$model" --thinking medium "$@"
+        ;;
+esac

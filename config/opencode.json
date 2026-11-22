@@ -1,0 +1,27 @@
+{
+  "model": "inkling-dgx/inkling-2-mini",
+  "agents": {
+    "title": {"disabled": true}
+  },
+  "providers": {
+    "inkling-dgx": {
+      "name": "DGX Spark",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:18121/v1",
+        "headerTimeout": 1800000,
+        "chunkTimeout": 1800000
+      },
+      "models": {
+        "inkling-2-mini": {
+          "modelID": "thinkingmachines/Inkling-2-Mini",
+          "name": "Inkling 2 Mini · DGX",
+          "capabilities": {"tools": true, "input": ["text", "image"], "output": ["text"]},
+          "compatibility": {"reasoningField": "reasoning_content"},
+          "body": {"reasoning_effort": "medium"},
+          "limit": {"context": 524288, "output": 24576}
+        }
+      }
+    }
+  }
+}
